@@ -1,0 +1,150 @@
+import { useContext } from "react"
+import { EmbeddedThreadContext } from "@/features/agents/lib/embeddedThread"
+import { useThreadRunConfig } from "@/features/agents/lib/threadRunConfig"
+import { ReviewChatActionsContext } from "@/features/reviews/components/ReviewChatActions"
+import { useMutation, useQueryClient } from "@tanstack/react-query"
+
+import type { SendAgentMessageVariables } from "@/features/agents/lib/queries"
+import type {
+  AgentThread,
+  PendingThreadMessage,
+} from "@/features/agents/lib/types"
+import { AgentsApiError } from "@/features/agents/lib/api"
+import {
+  agentThreadKeys,
+  setAgentThreadStatus,
+} from "@/features/agents/lib/queries"
+import { useThreadSource } from "@/features/agents/lib/threadSource/ThreadSourceProvider"
+import { modelConfigurable } from "@/features/agents/lib/stream/promptMessage"
+import { reportError } from "@/lib/errorReporting"
+
+export interface SubmitAgentMessageVariables extends SendAgentMessageVariables {
+  /** The stream can reject after the optimistic mutation has already resolved. */
+  onStartError?: () => void
+}
+
+function setPendingMessage(
+  thread: AgentThread,
+  message: PendingThreadMessage
+): AgentThread {
+  return {
+    ...thread,
+    pendingMessages: [
+      ...(thread.pendingMessages ?? []).filter(
+        (item) => item.id !== message.id
+      ),
+      message,
+    ],
+  }
+}
+
+/** Human-readable reason a send failed, shown under the failed bubble. */
+export function describeSendError(error: unknown): string {
+  if (error instanceof AgentsApiError) {
+    return error.message
+      ? `${error.status} ${error.message}`
+      : `${error.status}`
+  }
+  if (error instanceof Error) return error.message || error.name
+  return String(error)
+}
+
+/**
+ * Send a user message as a `run.start`. The server starts a run on an idle
+ * thread and steers the live run otherwise, so the client never has to know
+ * which; holding a message back until a boundary is the queue's job.
+ *
+ * The start is not awaited: the SDK stream's promise settles only when the
+ * run ends. The optimistic row stands in until the message shows up in the
+ * transcript or the queue. A rejected start marks that row failed.
+ */
+export function useSubmitAgentMessage(threadId: string) {
+  const queryClient = useQueryClient()
+  const source = useThreadSource()
+  const review = useContext(ReviewChatActionsContext)
+  const embedded = useContext(EmbeddedThreadContext)
+
+  return useMutation({
+    meta: { errorTitle: "Couldn't send message" },
+    mutationFn: async (vars: SubmitAgentMessageVariables) => {
+      if (vars.content.trim() === "/offload") {
+        if (source.isRunning) {
+          throw new Error(
+            "Wait for the current run to finish before offloading."
+          )
+        }
+        if (vars.images?.length) {
+          throw new Error("Offloading does not accept attachments.")
+        }
+        setAgentThreadStatus(queryClient, threadId, "running")
+        void source
+          .startRun({ configurable: { offload_conversation: true } })
+          .catch(() => setAgentThreadStatus(queryClient, threadId, "error"))
+        return
+      }
+      const id = vars.client_message_id ?? crypto.randomUUID()
+      const pendingMessage: PendingThreadMessage = {
+        id,
+        content: vars.content.trim(),
+        images: vars.images,
+        ...(vars.replies?.length ? { replies: vars.replies } : {}),
+        createdAt: Date.now(),
+        status: "sending",
+        ...(vars.enqueue ? { queued: true } : {}),
+      }
+      const updateThread = (update: (thread: AgentThread) => AgentThread) =>
+        queryClient.setQueryData<AgentThread>(
+          agentThreadKeys.detail(threadId),
+          (prev) => (prev ? update(prev) : prev)
+        )
+      updateThread((thread) => setPendingMessage(thread, pendingMessage))
+      // Set before the start is fired: a rejection below flips it to error and
+      // nothing may flip it back afterwards.
+      setAgentThreadStatus(queryClient, threadId, "running")
+
+      const configurable = modelConfigurable(
+        { modelId: vars.model_id, effort: vars.effort },
+        vars.model_selection_changed
+      )
+      const surface = useThreadRunConfig.getState().byThread[threadId]
+      await Promise.all([embedded?.run?.prepare?.(), surface?.prepare?.()])
+
+      void source
+        .startRun({
+          message: {
+            id,
+            text: vars.content,
+            images: vars.images,
+            replies: vars.replies,
+          },
+          configurable: {
+            ...configurable,
+            ...embedded?.run?.configurable,
+            ...surface?.configurable,
+            ...(review
+              ? {
+                  review_chat_pr_url: `https://github.com/${review.owner}/${review.repo}/pull/${review.number}`,
+                }
+              : {}),
+          },
+          ...(vars.enqueue ? { enqueue: true } : {}),
+        })
+        .catch((error: unknown) => {
+          const errorId = reportError({ title: "Couldn't send message", error })
+          updateThread((thread) =>
+            setPendingMessage(thread, {
+              ...pendingMessage,
+              status: "failed",
+              error: `${describeSendError(error)} · ID ${errorId}`,
+              // A failed enqueue never reaches the SDK's queue, so this
+              // must fall back into the normal timeline instead of
+              // rendering as a permanently pending queued row.
+              queued: false,
+            })
+          )
+          setAgentThreadStatus(queryClient, threadId, "error")
+          vars.onStartError?.()
+        })
+    },
+  })
+}

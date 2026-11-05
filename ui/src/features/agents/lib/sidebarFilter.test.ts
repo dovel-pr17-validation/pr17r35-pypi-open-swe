@@ -1,0 +1,149 @@
+import { describe, expect, it } from "vitest"
+
+import {
+  DEFAULT_SIDEBAR_FILTERS,
+  filterThreads,
+  hasActiveFilters,
+} from "./sidebarFilter"
+import type { SidebarFilters } from "./sidebarFilter"
+import type { AgentThread } from "./types"
+
+function makeThread(overrides: Partial<AgentThread> = {}): AgentThread {
+  return {
+    id: Math.random().toString(36).slice(2),
+    title: "Thread",
+    repo: "repo",
+    repoFullName: "acme/repo",
+    branch: "main",
+    model: "gpt-5",
+    source: "dashboard",
+    status: "idle",
+    viewed: true,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    messages: [],
+    ...overrides,
+  }
+}
+
+function filters(overrides: Partial<SidebarFilters> = {}): SidebarFilters {
+  return { ...DEFAULT_SIDEBAR_FILTERS, ...overrides }
+}
+
+describe("filterThreads", () => {
+  it("returns ordinary threads with default filters", () => {
+    const threads = [
+      makeThread(),
+      makeThread({ source: "schedule", threadCategory: "automation" }),
+    ]
+    expect(filterThreads(threads, DEFAULT_SIDEBAR_FILTERS)).toHaveLength(1)
+  })
+
+  it("keeps the actively viewed thread visible despite source and automation filters", () => {
+    const active = makeThread({
+      id: "active-thread",
+      source: "slack",
+      threadCategory: "automation",
+    })
+    const hidden = makeThread({ source: "slack" })
+    const visible = makeThread({ source: "github" })
+
+    expect(
+      filterThreads(
+        [active, hidden, visible],
+        filters({ sources: ["github"] }),
+        active.id
+      )
+    ).toEqual([active, visible])
+  })
+
+  it("hides archived threads even when actively viewed unless Show archived is enabled", () => {
+    const archived = makeThread({ id: "archived", resolved: true })
+    const ordinary = makeThread()
+    const threads = [archived, ordinary]
+
+    expect(filterThreads(threads, filters(), archived.id)).toEqual([ordinary])
+    expect(
+      filterThreads(threads, filters({ includeResolved: true }), archived.id)
+    ).toEqual(threads)
+  })
+
+  it("includes automations when requested", () => {
+    const ordinary = makeThread()
+    const automation = makeThread({
+      source: "schedule",
+      threadCategory: "automation",
+    })
+    expect(
+      filterThreads(
+        [ordinary, automation],
+        filters({ includeAutomations: true })
+      )
+    ).toEqual([ordinary, automation])
+  })
+
+  it("includes automations when Schedule is the selected source", () => {
+    const ordinary = makeThread()
+    const automation = makeThread({
+      source: "schedule",
+      threadCategory: "automation",
+    })
+    expect(
+      filterThreads([ordinary, automation], filters({ sources: ["schedule"] }))
+    ).toEqual([automation])
+  })
+
+  it("hides Slack threads but keeps threads moved to the dashboard", () => {
+    const slack = makeThread({ source: "slack" })
+    const movedToWeb = makeThread({ source: "dashboard" })
+    const github = makeThread({ source: "github" })
+    expect(
+      filterThreads(
+        [slack, movedToWeb, github],
+        filters({ includeSlack: false })
+      )
+    ).toEqual([movedToWeb, github])
+  })
+
+  it("filters by source, defaulting missing source to dashboard", () => {
+    const gh = makeThread({ source: "github" })
+    const noSource = makeThread({ source: undefined })
+    expect(
+      filterThreads([gh, noSource], filters({ sources: ["dashboard"] }))
+    ).toEqual([noSource])
+    expect(
+      filterThreads([gh, noSource], filters({ sources: ["github"] }))
+    ).toEqual([gh])
+  })
+})
+
+it("retains a nonmatching coordinator as context for matching workers", () => {
+  const match = makeThread({ source: "dashboard" })
+  const sibling = makeThread({ source: "github" })
+  const parent = makeThread({ source: "slack", taskWorkers: [match, sibling] })
+  expect(filterThreads([parent], filters({ sources: ["dashboard"] }))).toEqual([
+    { ...parent, taskWorkers: [match] },
+  ])
+})
+
+describe("hasActiveFilters", () => {
+  it("treats owned-only as filtering even when it is the default", () => {
+    expect(hasActiveFilters(DEFAULT_SIDEBAR_FILTERS)).toBe(true)
+    expect(hasActiveFilters(filters({ ownedOnly: false }))).toBe(false)
+  })
+
+  it("still detects other filters when showing all owners", () => {
+    expect(
+      hasActiveFilters(filters({ ownedOnly: false, includeSlack: false }))
+    ).toBe(true)
+    expect(
+      hasActiveFilters(filters({ ownedOnly: false, sources: ["github"] }))
+    ).toBe(true)
+    expect(
+      hasActiveFilters(filters({ ownedOnly: false, includeAutomations: true }))
+    ).toBe(true)
+    expect(
+      hasActiveFilters(filters({ ownedOnly: false, includeResolved: true }))
+    ).toBe(true)
+  })
+})

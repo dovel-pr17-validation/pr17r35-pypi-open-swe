@@ -1,0 +1,121 @@
+from unittest.mock import AsyncMock
+
+import httpx2
+import pytest
+from fastapi import HTTPException
+
+from openswe.review.reviews import (
+    _ALLOWED_IMAGE_CONTENT_TYPES,
+    _image_request_headers,
+    _is_allowed_image_url,
+    _require_image_in_pr,
+    _serialize_pr_details,
+)
+
+
+@pytest.mark.parametrize("merged, expected", [(False, "closed"), (True, "merged")])
+def test_review_details_preserve_closed_draft_lifecycle(merged: bool, expected: str):
+    details = _serialize_pr_details({"state": "closed", "draft": True, "merged": merged})
+
+    assert details["state"] == expected
+
+
+def test_description_references_only_identifies_same_repo_pull_requests():
+    from openswe.review.reviews import DescriptionReferences
+
+    references = DescriptionReferences(
+        '<a href="https://github.com/acme/repo/issues/4879">#4879</a>'
+        '<a href="https://github.com/acme/repo/pull/12">#12</a>'
+        '<a href="https://github.com/acme/other/pull/13">acme/other#13</a>'
+        "<code>#14</code>"
+    )
+    assert references.pull_request_numbers("acme", "repo") == [12]
+
+
+def test_is_allowed_image_url_rejects_unsafe_urls():
+    # Non-https scheme.
+    assert not _is_allowed_image_url("http://github.com/user-attachments/assets/x")
+    # github.com but not a user-attachment path.
+    assert not _is_allowed_image_url("https://github.com/langchain-ai/open-swe")
+    # Arbitrary external host (SSRF guard).
+    assert not _is_allowed_image_url("https://evil.example.com/x.png")
+    # Lookalike host that merely contains the suffix substring.
+    assert not _is_allowed_image_url("https://githubusercontent.com.evil.com/x.png")
+    # Internal address.
+    assert not _is_allowed_image_url("https://169.254.169.254/latest/meta-data")
+
+
+def test_is_allowed_image_url_accepts_only_githubs_asset_bucket():
+    assert _is_allowed_image_url(
+        "https://github-production-user-asset-6210df.s3.amazonaws.com/1/x.png?X-Amz-Signature=y"
+    )
+    assert not _is_allowed_image_url("https://attacker-bucket.s3.amazonaws.com/x.png")
+
+
+def test_image_token_only_reaches_githubusercontent():
+    assert "Authorization" in _image_request_headers(
+        "https://private-user-images.githubusercontent.com/1/x.png", "tok"
+    )
+    assert "Authorization" not in _image_request_headers(
+        "https://github.com/user-attachments/assets/abc", "tok"
+    )
+    assert "Authorization" not in _image_request_headers(
+        "https://github-production-user-asset-6210df.s3.amazonaws.com/1/x.png", "tok"
+    )
+
+
+def test_image_content_type_allowlist_excludes_svg():
+    # SVG can execute script in our origin, so it must never be served.
+    assert "image/svg+xml" not in _ALLOWED_IMAGE_CONTENT_TYPES
+    assert "image/png" in _ALLOWED_IMAGE_CONTENT_TYPES
+
+
+async def test_label_write_requires_repository_access(monkeypatch):
+    from openswe.review.labels import LabelChange
+    from openswe.review.routes import api_change_pull_request_label
+
+    async def deny_access(user_id: str, repo: str) -> None:
+        raise HTTPException(403, "Repository access denied")
+
+    monkeypatch.setattr("openswe.review.routes.require_repo_access_for_user", deny_access)
+    with pytest.raises(HTTPException) as exc:
+        await api_change_pull_request_label(
+            "acme", "private", 7, LabelChange(name="bug", selected=True), {"sub": "user"}
+        )
+    assert exc.value.status_code == 403
+
+
+async def test_require_image_in_pr_rejects_unreferenced_url(monkeypatch):
+    pull = httpx2.Response(
+        200,
+        json={"body": "see ![diagram](https://x.githubusercontent.com/a.png)"},
+        request=httpx2.Request("GET", "https://api.github.com"),
+    )
+    monkeypatch.setattr(
+        "openswe.github.app.get_github_app_installation_token", AsyncMock(return_value="tok")
+    )
+    monkeypatch.setattr("openswe.github.http.github_request", AsyncMock(return_value=pull))
+
+    # A URL not present in the PR body (cross-repo IDOR attempt) is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await _require_image_in_pr(
+            "acme", "repo", 7, "https://x.githubusercontent.com/other-repo.png"
+        )
+    assert exc.value.status_code == 403
+
+    # A URL actually embedded in the PR body is allowed.
+    await _require_image_in_pr("acme", "repo", 7, "https://x.githubusercontent.com/a.png")
+
+
+async def test_review_chat_rejects_thread_not_postable_for_this_pr(monkeypatch) -> None:
+    from openswe.review import chat as review_chat_api
+
+    async def no_accessible_threads(*args):
+        return []
+
+    monkeypatch.setattr(review_chat_api.pr_fixes, "find_pr_threads", no_accessible_threads)
+    with pytest.raises(HTTPException) as error:
+        await review_chat_api.proxy_review_chat_commands(
+            "acme", "repo", 7, "octocat", "foreign-thread", b"{}"
+        )
+    assert error.value.status_code == 404
